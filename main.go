@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 
@@ -14,8 +15,6 @@ import (
 	"gopkg.in/mewpkg/hashutil.v1/crc16"
 	"gopkg.in/mewpkg/hashutil.v1/crc8"
 )
-
-const headerPadding = 64 * 1024
 
 func init() {
 	flag.Usage = usage
@@ -35,10 +34,11 @@ var frameSizeMin, frameSizeMax uint32
 var sampleRate uint32
 var nChannels, bitsPerSample uint8
 var totalBytes, totalSamples, totalFrames uint64
+
 var seekTable []meta.SeekPoint
 var seekMap map[uint64]int
 
-var rf *os.File
+var rf, ro *os.File
 var md5sum hash.Hash
 
 func main() {
@@ -52,12 +52,13 @@ func main() {
 	}
 
 	// create output file
-	rf, err = os.Create("result.flac")
+	rf, err = ioutil.TempFile(os.TempDir(), "flac2one")
 	if err != nil {
+		log.Fatalln(err)
 		os.Exit(2)
 	}
-	// padding for meta
-	rf.Seek(headerPadding, os.SEEK_SET)
+	defer os.Remove(rf.Name())
+	defer rf.Close()
 
 	// read files
 	md5sum = md5.New()
@@ -73,11 +74,17 @@ func main() {
 		}
 		first = false
 	}
-	rf.Seek(0, os.SEEK_SET)
+
+	ro, err = os.Create("result.flac")
+	if err != nil {
+		log.Fatalln(err)
+		os.Exit(2)
+	}
+	defer ro.Close()
 
 	var b []byte
 	// STREAM: header
-	_, err = rf.Write([]byte("fLaC"))
+	_, err = ro.Write([]byte("fLaC"))
 	if err != nil {
 		os.Exit(2)
 	}
@@ -86,7 +93,7 @@ func main() {
 	b = make([]byte, 4)
 	b[0] = 0
 	b[3] = 34
-	rf.Write(b)
+	ro.Write(b)
 
 	// METADATA_BLOCK_STREAMINFO
 	b = make([]byte, 34)
@@ -109,7 +116,7 @@ func main() {
 	b[16] = byte(totalSamples >> 8 & 255)
 	b[17] = byte(totalSamples & 255)
 	copy(b[18:], md5sum.Sum(nil))
-	rf.Write(b)
+	ro.Write(b)
 
 	if len(seekTable) > 0 {
 		// METADATA_BLOCK_HEADER: seektable
@@ -119,7 +126,7 @@ func main() {
 		b[1] = byte(size >> 16 & 255)
 		b[2] = byte(size >> 8 & 255)
 		b[3] = byte(size & 255)
-		rf.Write(b)
+		ro.Write(b)
 
 		// METADATA_BLOCK_SEEKTABLE
 		b = make([]byte, 8+8+2)
@@ -142,24 +149,22 @@ func main() {
 			b[15] = byte(v.Offset & 255)
 			b[16] = byte(v.NSamples >> 8 & 255)
 			b[17] = byte(v.NSamples & 255)
-			rf.Write(b)
+			ro.Write(b)
 		}
 	}
 
 	// METADATA_BLOCK_HEADER: padding
-	offset, err := rf.Seek(0, os.SEEK_CUR)
+	offset, err := ro.Seek(0, os.SEEK_CUR)
+	padding := 256 - (offset+4)&(256-1)
 	b = make([]byte, 4)
-	padding := headerPadding - offset - 4
 	b[0] = 1<<7 | 1
-	b[1] = byte(padding >> 16 & 255)
-	b[2] = byte(padding >> 8 & 255)
-	b[3] = byte(padding & 255)
-	rf.Write(b)
+	b[3] = byte(padding)
+	ro.Write(b)
+	ro.Seek(padding, os.SEEK_CUR)
 
-	// METADATA_BLOCK_PADDING
-	// (already)
-
-	rf.Close()
+	// copy frames
+	rf.Seek(0, os.SEEK_SET)
+	io.Copy(ro, rf)
 }
 
 func list(path string) (err error) {
@@ -180,23 +185,23 @@ func list(path string) (err error) {
 		frameSizeMin = 4294967295
 		frameSizeMax = 0
 		if blockSizeMin != blockSizeMax {
-			return fmt.Errorf("flac2cue: not fixed-blocksize; min %v, max %v", stream.Info.BlockSizeMin, stream.Info.BlockSizeMax)
+			return fmt.Errorf("not fixed-blocksize; min %v, max %v", stream.Info.BlockSizeMin, stream.Info.BlockSizeMax)
 		}
 	} else {
 		if sampleRate != stream.Info.SampleRate {
-			return fmt.Errorf("flac2cue: sample rate mismatch; expected %v, got %v", sampleRate, stream.Info.SampleRate)
+			return fmt.Errorf("sample rate mismatch; expected %v, got %v", sampleRate, stream.Info.SampleRate)
 		}
 		if nChannels != stream.Info.NChannels {
-			return fmt.Errorf("flac2cue: num of channels mismatch; expected %v, got %v", nChannels, stream.Info.NChannels)
+			return fmt.Errorf("num of channels mismatch; expected %v, got %v", nChannels, stream.Info.NChannels)
 		}
 		if bitsPerSample != stream.Info.BitsPerSample {
-			return fmt.Errorf("flac2cue: bits per sample mismatch; expected %v, got %v", bitsPerSample, stream.Info.BitsPerSample)
+			return fmt.Errorf("bits per sample mismatch; expected %v, got %v", bitsPerSample, stream.Info.BitsPerSample)
 		}
 		if blockSizeMin != stream.Info.BlockSizeMin {
-			return fmt.Errorf("flac2cue: min blocksize mismatch; expected %v, got %v", blockSizeMin, stream.Info.BlockSizeMin)
+			return fmt.Errorf("min blocksize mismatch; expected %v, got %v", blockSizeMin, stream.Info.BlockSizeMin)
 		}
 		if blockSizeMax != stream.Info.BlockSizeMax {
-			return fmt.Errorf("flac2cue: max blocksize mismatch; expected %v, got %v", blockSizeMax, stream.Info.BlockSizeMax)
+			return fmt.Errorf("max blocksize mismatch; expected %v, got %v", blockSizeMax, stream.Info.BlockSizeMax)
 		}
 	}
 
@@ -237,7 +242,7 @@ func list(path string) (err error) {
 		}
 		// wait for https://github.com/mewkiz/flac/issues/8
 		if false && frame.HasFixedBlockSize != true {
-			return fmt.Errorf("flac2cue: frame hasn't fixed-blocksize")
+			return fmt.Errorf("frame hasn't fixed-blocksize")
 		}
 		frame.Hash(md5sum)
 		next, err := stream.Pos()

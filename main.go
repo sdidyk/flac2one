@@ -173,8 +173,8 @@ func list(path string) (err error) {
 		bitsPerSample = stream.Info.BitsPerSample
 		blockSizeMin = stream.Info.BlockSizeMin
 		blockSizeMax = stream.Info.BlockSizeMax
-		frameSizeMin = stream.Info.FrameSizeMin
-		frameSizeMax = stream.Info.FrameSizeMax
+		frameSizeMin = 4294967295
+		frameSizeMax = 0
 		if blockSizeMin != blockSizeMax {
 			return fmt.Errorf("flac2cue: not fixed-blocksize; min %v, max %v", stream.Info.BlockSizeMin, stream.Info.BlockSizeMax)
 		}
@@ -193,12 +193,6 @@ func list(path string) (err error) {
 		}
 		if blockSizeMax != stream.Info.BlockSizeMax {
 			return fmt.Errorf("flac2cue: max blocksize mismatch; expected %v, got %v", blockSizeMax, stream.Info.BlockSizeMax)
-		}
-		if stream.Info.FrameSizeMin < frameSizeMin {
-			frameSizeMin = stream.Info.FrameSizeMin
-		}
-		if stream.Info.FrameSizeMax > frameSizeMax {
-			frameSizeMax = stream.Info.FrameSizeMax
 		}
 	}
 
@@ -253,24 +247,69 @@ func list(path string) (err error) {
 
 		// copy frame
 		// (header)
+		b := make([]byte, 4)
 		f.Seek(start, os.SEEK_SET)
-		io.CopyN(rf, hr, 4)
-		totalBytes += uint64(4)
+		hr.Read(b)
+		rf.Write(b)
+		totalBytes += 4
+
+		additionalBytes := int64(0)
+		// blocksize bits == 011x
+		if b[2]&0xE0 == 0x60 {
+			additionalBytes += 1
+			if b[2]&0x10>>4 != 0 {
+				additionalBytes += 1
+			}
+		}
+		// sample rate bits == 11xx
+		if b[2]&0x0C == 0x0C {
+			additionalBytes += 1
+			if b[2]&0x03 != 0 {
+				additionalBytes += 1
+			}
+		}
+
 		// (new frame number)
 		n, _ = rf.Write(newFrameNum)
 		totalBytes += uint64(n)
+		crcHeader.Write(newFrameNum)
 		crcFrame.Write(newFrameNum)
+
+		// (additional bytes)
+		if additionalBytes > 0 {
+			f.Seek(start+4+frameNumBytes, os.SEEK_SET)
+			io.CopyN(rf, hr, additionalBytes)
+			totalBytes += uint64(additionalBytes)
+		}
+
+		// (new crc8)
+		crc8 := crcHeader.Sum8()
+		n, _ = rf.Write([]byte{crc8})
+		totalBytes += 1
+		crcFrame.Write([]byte{crc8})
+
 		// (rest of frame)
-		restSize := size - (frameNumBytes + 4) - 2
-		f.Seek(start+frameNumBytes+4, os.SEEK_SET)
+		restSize := size - (4 + frameNumBytes + additionalBytes + 1) - 2
+		f.Seek(start+4+frameNumBytes+additionalBytes+1, os.SEEK_SET)
 		io.CopyN(rf, hr, restSize)
 		totalBytes += uint64(restSize)
+
 		// (new crc16)
 		crc16 := crcFrame.Sum16()
 		n, _ = rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
 		totalBytes += uint64(n)
 
 		// next iteration
+		if frameNumBytes < int64(len(newFrameNum)) {
+			size += int64(len(newFrameNum)) - frameNumBytes
+		}
+		if uint32(size) < frameSizeMin {
+			frameSizeMin = uint32(size)
+		}
+		if uint32(size) > frameSizeMax {
+			frameSizeMax = uint32(size)
+		}
+		//
 		start = next
 		frames++
 	}

@@ -37,6 +37,7 @@ var totalBytes, totalSamples, totalFrames uint64
 
 var seekTable []meta.SeekPoint
 var seekMap map[uint64]int
+var picture *meta.Block
 
 var rf, ro *os.File
 var md5sum hash.Hash
@@ -91,7 +92,7 @@ func main() {
 
 	// METADATA_BLOCK_HEADER: streaminfo
 	b = make([]byte, 4)
-	b[0] = 0
+	b[0] = byte(meta.TypeStreamInfo)
 	b[3] = 34
 	ro.Write(b)
 
@@ -122,7 +123,7 @@ func main() {
 		// METADATA_BLOCK_HEADER: seektable
 		b = make([]byte, 4)
 		size := (8 + 8 + 2) * len(seekTable)
-		b[0] = 3
+		b[0] = byte(meta.TypeSeekTable)
 		b[1] = byte(size >> 16 & 255)
 		b[2] = byte(size >> 8 & 255)
 		b[3] = byte(size & 255)
@@ -153,11 +154,49 @@ func main() {
 		}
 	}
 
+	if picture != nil {
+		// METADATA_BLOCK_HEADER: picture
+		b = make([]byte, 4)
+		b[0] = byte(meta.TypePicture)
+		b[1] = byte(picture.Length >> 16 & 255)
+		b[2] = byte(picture.Length >> 8 & 255)
+		b[3] = byte(picture.Length & 255)
+		ro.Write(b)
+
+		// METADATA_BLOCK_PICTURE
+		b = make([]byte, picture.Length)
+		picture := picture.Body.(*meta.Picture)
+		offset := 0
+		encUint32(b[offset:], picture.Type)
+		offset += 4
+		encUint32(b[offset:], uint32(len(picture.MIME)))
+		offset += 4
+		copy(b[offset:], picture.MIME)
+		offset += len(picture.MIME)
+		encUint32(b[offset:], uint32(len(picture.Desc)))
+		offset += 4
+		copy(b[offset:], picture.Desc)
+		offset += len(picture.Desc)
+		encUint32(b[offset:], picture.Width)
+		offset += 4
+		encUint32(b[offset:], picture.Height)
+		offset += 4
+		encUint32(b[offset:], picture.Depth)
+		offset += 4
+		encUint32(b[offset:], picture.NPalColors)
+		offset += 4
+		encUint32(b[offset:], uint32(len(picture.Data)))
+		offset += 4
+		copy(b[offset:], picture.Data)
+
+		ro.Write(b)
+	}
+
 	// METADATA_BLOCK_HEADER: padding
 	offset, err := ro.Seek(0, os.SEEK_CUR)
 	padding := 256 - (offset+4)&(256-1)
 	b = make([]byte, 4)
-	b[0] = 1<<7 | 1
+	b[0] = 1<<7 | byte(meta.TypePadding)
 	b[3] = byte(padding)
 	ro.Write(b)
 	ro.Seek(padding, os.SEEK_CUR)
@@ -206,10 +245,36 @@ func list(path string) (err error) {
 	}
 
 	// get meta
-	for blockNum, block := range stream.Blocks {
-		listBlock(block, blockNum+1)
+	for _, block := range stream.Blocks {
+		switch body := block.Body.(type) {
+		case *meta.SeekTable:
+			for _, point := range body.Points {
+				if point.SampleNum != meta.PlaceholderPoint {
+					seekMap[point.SampleNum+totalSamples] = len(seekTable)
+					seekTable = append(
+						seekTable,
+						meta.SeekPoint{
+							point.SampleNum + totalSamples,
+							0,
+							point.NSamples,
+						},
+					)
+				}
+			}
+
+		case *meta.VorbisComment:
+			// for tagNum, tag := range body.Tags {
+			// 	fmt.Printf("    comment[%d]: %s=%s\n", tagNum, tag[0], tag[1])
+			// }
+
+		case *meta.Picture:
+			if first && picture == nil && body.Type == 3 {
+				picture = block
+			}
+		}
 	}
 
+	// get start offset
 	start, err := stream.Pos()
 	if err != nil {
 		return err
@@ -307,54 +372,32 @@ func list(path string) (err error) {
 		rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
 		totalBytes += 2
 
-		// next iteration
+		// recalculate seektable offset
 		sampleNum := frame.Num*uint64(blockSizeMin) + totalSamples
 		if i, ok := seekMap[sampleNum]; ok {
 			seekTable[i].Offset = offset
 		}
+		// recalculate new frame size
 		if frameNumBytes < int64(len(newFrameNum)) {
 			size += int64(len(newFrameNum)) - frameNumBytes
 		}
+		// update min and max
 		if uint32(size) < frameSizeMin {
 			frameSizeMin = uint32(size)
 		}
 		if uint32(size) > frameSizeMax {
 			frameSizeMax = uint32(size)
 		}
+		// next iteration
 		start = next
 		frames++
 	}
+
+	// update totals
 	totalSamples += stream.Info.NSamples
 	totalFrames += frames
 
 	return nil
-}
-
-func listBlock(block *meta.Block, blockNum int) {
-	switch body := block.Body.(type) {
-	case *meta.SeekTable:
-		for _, point := range body.Points {
-			if point.SampleNum != meta.PlaceholderPoint {
-				seekMap[point.SampleNum+totalSamples] = len(seekTable)
-				seekTable = append(
-					seekTable,
-					meta.SeekPoint{
-						point.SampleNum + totalSamples,
-						0,
-						point.NSamples,
-					},
-				)
-			}
-		}
-
-	case *meta.VorbisComment:
-		// for tagNum, tag := range body.Tags {
-		// 	fmt.Printf("    comment[%d]: %s=%s\n", tagNum, tag[0], tag[1])
-		// }
-
-	case *meta.Picture:
-		// listPicture(body)
-	}
 }
 
 func getUtf8Size(n uint64) (s int64) {
@@ -429,4 +472,12 @@ func encodeUtf8(n uint64) []byte {
 
 	}
 
+}
+
+func encUint32(b []byte, n uint32) {
+	b[0] = byte(n >> 24 & 255)
+	b[1] = byte(n >> 16 & 255)
+	b[2] = byte(n >> 8 & 255)
+	b[3] = byte(n & 255)
+	return
 }

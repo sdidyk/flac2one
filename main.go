@@ -15,6 +15,8 @@ import (
 	"gopkg.in/mewpkg/hashutil.v1/crc8"
 )
 
+const headerPadding = 64 * 1024
+
 func init() {
 	flag.Usage = usage
 }
@@ -34,6 +36,7 @@ var sampleRate uint32
 var nChannels, bitsPerSample uint8
 var totalBytes, totalSamples, totalFrames uint64
 var seekTable []meta.SeekPoint
+var seekMap map[uint64]int
 
 var rf *os.File
 var md5sum hash.Hash
@@ -54,11 +57,12 @@ func main() {
 		os.Exit(2)
 	}
 	// padding for meta
-	rf.Seek(1024*64, os.SEEK_SET)
+	rf.Seek(headerPadding, os.SEEK_SET)
 
 	// read files
 	md5sum = md5.New()
 	seekTable = make([]meta.SeekPoint, 0, 1024)
+	seekMap = make(map[uint64]int, 1024)
 	first = true
 	for _, path := range flag.Args() {
 		fmt.Println(path)
@@ -107,7 +111,7 @@ func main() {
 	copy(b[18:], md5sum.Sum(nil))
 	rf.Write(b)
 
-	if false && len(seekTable) > 0 {
+	if len(seekTable) > 0 {
 		// METADATA_BLOCK_HEADER: seektable
 		b = make([]byte, 4)
 		size := (8 + 8 + 2) * len(seekTable)
@@ -145,7 +149,7 @@ func main() {
 	// METADATA_BLOCK_HEADER: padding
 	offset, err := rf.Seek(0, os.SEEK_CUR)
 	b = make([]byte, 4)
-	padding := 1024*64 - offset - 4
+	padding := headerPadding - offset - 4
 	b[0] = 1<<7 | 1
 	b[1] = byte(padding >> 16 & 255)
 	b[2] = byte(padding >> 8 & 255)
@@ -201,7 +205,6 @@ func list(path string) (err error) {
 		listBlock(block, blockNum+1)
 	}
 
-	totalSamples += stream.Info.NSamples
 	start, err := stream.Pos()
 	if err != nil {
 		return err
@@ -218,6 +221,7 @@ func list(path string) (err error) {
 	frames := uint64(0)
 	for {
 		var n int
+		offset := totalBytes
 		crcHeader := crc8.NewATM()
 		crcFrame := crc16.NewIBM()
 
@@ -243,7 +247,6 @@ func list(path string) (err error) {
 		size := next - start
 		frameNumBytes := getUtf8Size(frame.Num)
 		newFrameNum := encodeUtf8(frame.Num + totalFrames)
-		// fmt.Println(start, size, frame.Num*uint64(blockSizeMin))
 
 		// copy frame
 		// (header)
@@ -296,10 +299,14 @@ func list(path string) (err error) {
 
 		// (new crc16)
 		crc16 := crcFrame.Sum16()
-		n, _ = rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
-		totalBytes += uint64(n)
+		rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
+		totalBytes += 2
 
 		// next iteration
+		sampleNum := frame.Num*uint64(blockSizeMin) + totalSamples
+		if i, ok := seekMap[sampleNum]; ok {
+			seekTable[i].Offset = offset
+		}
 		if frameNumBytes < int64(len(newFrameNum)) {
 			size += int64(len(newFrameNum)) - frameNumBytes
 		}
@@ -309,30 +316,31 @@ func list(path string) (err error) {
 		if uint32(size) > frameSizeMax {
 			frameSizeMax = uint32(size)
 		}
-		//
 		start = next
 		frames++
 	}
+	totalSamples += stream.Info.NSamples
 	totalFrames += frames
 
 	return nil
 }
 
 func listBlock(block *meta.Block, blockNum int) {
-	switch block.Body.(type) {
+	switch body := block.Body.(type) {
 	case *meta.SeekTable:
-		// for _, point := range body.Points {
-		// 	if point.SampleNum != meta.PlaceholderPoint {
-		// 		seekTable = append(
-		// 			seekTable,
-		// 			meta.SeekPoint{
-		// 				point.SampleNum + totalSamples,
-		// 				point.Offset + totalBytes,
-		// 				point.NSamples,
-		// 			},
-		// 		)
-		// 	}
-		// }
+		for _, point := range body.Points {
+			if point.SampleNum != meta.PlaceholderPoint {
+				seekMap[point.SampleNum+totalSamples] = len(seekTable)
+				seekTable = append(
+					seekTable,
+					meta.SeekPoint{
+						point.SampleNum + totalSamples,
+						0,
+						point.NSamples,
+					},
+				)
+			}
+		}
 
 	case *meta.VorbisComment:
 		// for tagNum, tag := range body.Tags {

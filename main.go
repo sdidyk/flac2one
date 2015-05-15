@@ -11,12 +11,11 @@ import (
 
 	"github.com/sdidyk/flac2one/flac"
 	"gopkg.in/mewkiz/flac.v1/meta"
+	"gopkg.in/mewpkg/hashutil.v1/crc16"
+	"gopkg.in/mewpkg/hashutil.v1/crc8"
 )
 
-var flagMD5 bool
-
 func init() {
-	flag.BoolVar(&flagMD5, "with-md5", false, "Calculate new MD5 (should be very long)")
 	flag.Usage = usage
 }
 
@@ -33,7 +32,7 @@ var blockSizeMin, blockSizeMax uint16
 var frameSizeMin, frameSizeMax uint32
 var sampleRate uint32
 var nChannels, bitsPerSample uint8
-var totalBytes, totalSamples uint64
+var totalBytes, totalSamples, totalFrames uint64
 var seekTable []meta.SeekPoint
 
 var rf *os.File
@@ -55,10 +54,7 @@ func main() {
 		os.Exit(2)
 	}
 	// padding for meta
-	_, err = rf.Seek(1024*64, os.SEEK_SET)
-	if err != nil {
-		os.Exit(2)
-	}
+	rf.Seek(1024*64, os.SEEK_SET)
 
 	// read files
 	md5sum = md5.New()
@@ -73,10 +69,7 @@ func main() {
 		}
 		first = false
 	}
-	_, err = rf.Seek(0, os.SEEK_SET)
-	if err != nil {
-		os.Exit(2)
-	}
+	rf.Seek(0, os.SEEK_SET)
 
 	var b []byte
 	// STREAM: header
@@ -183,7 +176,7 @@ func list(path string) (err error) {
 		frameSizeMin = stream.Info.FrameSizeMin
 		frameSizeMax = stream.Info.FrameSizeMax
 		if blockSizeMin != blockSizeMax {
-			return fmt.Errorf("flac2cue: not fixed-size block; min %v, max %v", stream.Info.BlockSizeMin, stream.Info.BlockSizeMax)
+			return fmt.Errorf("flac2cue: not fixed-blocksize; min %v, max %v", stream.Info.BlockSizeMin, stream.Info.BlockSizeMax)
 		}
 	} else {
 		if sampleRate != stream.Info.SampleRate {
@@ -215,23 +208,9 @@ func list(path string) (err error) {
 	}
 
 	totalSamples += stream.Info.NSamples
-	offset, err := stream.Pos()
+	start, err := stream.Pos()
 	if err != nil {
 		return err
-	}
-
-	// update new md5
-	if flagMD5 {
-		for {
-			frame, err := stream.ParseNext()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return err
-			}
-			frame.Hash(md5sum)
-		}
 	}
 
 	// reopen file for copying
@@ -241,35 +220,80 @@ func list(path string) (err error) {
 	}
 	defer f.Close()
 
-	// copy frames
-	_, err = f.Seek(offset, os.SEEK_SET)
-	if err != nil {
-		return err
+	// rewrite frames
+	frames := uint64(0)
+	for {
+		var n int
+		crcHeader := crc8.NewATM()
+		crcFrame := crc16.NewIBM()
+
+		fr := io.TeeReader(f, crcHeader)
+		hr := io.TeeReader(fr, crcFrame)
+
+		frame, err := stream.ParseNext()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		// wait for https://github.com/mewkiz/flac/issues/8
+		if false && frame.HasFixedBlockSize != true {
+			return fmt.Errorf("flac2cue: frame hasn't fixed-blocksize")
+		}
+		frame.Hash(md5sum)
+		next, err := stream.Pos()
+		if err != nil {
+			return err
+		}
+		size := next - start
+		frameNumBytes := getUtf8Size(frame.Num)
+		newFrameNum := encodeUtf8(frame.Num + totalFrames)
+		// fmt.Println(start, size, frame.Num*uint64(blockSizeMin))
+
+		// copy frame
+		// (header)
+		f.Seek(start, os.SEEK_SET)
+		io.CopyN(rf, hr, 4)
+		totalBytes += uint64(4)
+		// (new frame number)
+		n, _ = rf.Write(newFrameNum)
+		totalBytes += uint64(n)
+		crcFrame.Write(newFrameNum)
+		// (rest of frame)
+		restSize := size - (frameNumBytes + 4) - 2
+		f.Seek(start+frameNumBytes+4, os.SEEK_SET)
+		io.CopyN(rf, hr, restSize)
+		totalBytes += uint64(restSize)
+		// (new crc16)
+		crc16 := crcFrame.Sum16()
+		n, _ = rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
+		totalBytes += uint64(n)
+
+		// next iteration
+		start = next
+		frames++
 	}
-	n, err := io.Copy(rf, f)
-	if err != nil {
-		return err
-	}
-	totalBytes += uint64(n)
+	totalFrames += frames
 
 	return nil
 }
 
 func listBlock(block *meta.Block, blockNum int) {
-	switch body := block.Body.(type) {
+	switch block.Body.(type) {
 	case *meta.SeekTable:
-		for _, point := range body.Points {
-			if point.SampleNum != meta.PlaceholderPoint {
-				seekTable = append(
-					seekTable,
-					meta.SeekPoint{
-						point.SampleNum + totalSamples,
-						point.Offset + totalBytes,
-						point.NSamples,
-					},
-				)
-			}
-		}
+		// for _, point := range body.Points {
+		// 	if point.SampleNum != meta.PlaceholderPoint {
+		// 		seekTable = append(
+		// 			seekTable,
+		// 			meta.SeekPoint{
+		// 				point.SampleNum + totalSamples,
+		// 				point.Offset + totalBytes,
+		// 				point.NSamples,
+		// 			},
+		// 		)
+		// 	}
+		// }
 
 	case *meta.VorbisComment:
 		// for tagNum, tag := range body.Tags {
@@ -279,4 +303,78 @@ func listBlock(block *meta.Block, blockNum int) {
 	case *meta.Picture:
 		// listPicture(body)
 	}
+}
+
+func getUtf8Size(n uint64) (s int64) {
+	if n <= 1<<7-1 {
+		s = 1
+	} else if n <= 1<<11-1 {
+		s = 2
+	} else if n <= 1<<16-1 {
+		s = 3
+	} else if n <= 1<<21-1 {
+		s = 4
+	} else if n <= 1<<26-1 {
+		s = 5
+	} else if n <= 1<<31-1 {
+		s = 6
+	} else {
+		s = 7
+	}
+	return
+}
+
+func encodeUtf8(n uint64) []byte {
+	b := make([]byte, 7)
+	if n <= 1<<7-1 {
+		b[0] = byte(n & 0x7F)
+		return b[:1]
+
+	} else if n <= 1<<11-1 {
+		b[0] = byte(n>>6&0x1F | 0xC0)
+		b[1] = byte(n&0x3F | 0x80)
+		return b[:2]
+
+	} else if n <= 1<<16-1 {
+		b[0] = byte(n>>12&0x0F | 0xE0)
+		b[1] = byte(n>>6&0x3F | 0x80)
+		b[2] = byte(n&0x3F | 0x80)
+		return b[:3]
+
+	} else if n <= 1<<21-1 {
+		b[0] = byte(n>>18&0x07 | 0xF0)
+		b[1] = byte(n>>12&0x3F | 0x80)
+		b[2] = byte(n>>6&0x3F | 0x80)
+		b[3] = byte(n&0x3F | 0x80)
+		return b[:4]
+
+	} else if n <= 1<<26-1 {
+		b[0] = byte(n>>24&0x03 | 0xF8)
+		b[1] = byte(n>>18&0x3F | 0x80)
+		b[2] = byte(n>>12&0x3F | 0x80)
+		b[3] = byte(n>>6&0x3F | 0x80)
+		b[4] = byte(n&0x3F | 0x80)
+		return b[:5]
+
+	} else if n <= 1<<31-1 {
+		b[0] = byte(n>>30&0x01 | 0xFC)
+		b[1] = byte(n>>24&0x3F | 0x80)
+		b[2] = byte(n>>18&0x3F | 0x80)
+		b[3] = byte(n>>12&0x3F | 0x80)
+		b[4] = byte(n>>6&0x3F | 0x80)
+		b[5] = byte(n&0x3F | 0x80)
+		return b[:6]
+
+	} else {
+		b[0] = byte(0xFE)
+		b[1] = byte(n>>30&0x3F | 0x80)
+		b[2] = byte(n>>24&0x3F | 0x80)
+		b[3] = byte(n>>18&0x3F | 0x80)
+		b[4] = byte(n>>12&0x3F | 0x80)
+		b[5] = byte(n>>6&0x3F | 0x80)
+		b[6] = byte(n&0x3F | 0x80)
+		return b[:7]
+
+	}
+
 }

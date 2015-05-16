@@ -394,25 +394,26 @@ func list(path string) (err error) {
 			}
 			return err
 		}
-		// wait for https://github.com/mewkiz/flac/issues/8
+		// update md5
 		frame.Hash(md5sum)
+
+		// get frame size
 		next, err := stream.Pos()
 		if err != nil {
 			return err
 		}
 		size := next - start
-		frameNumBytes := getUtf8Size(frame.Num)
-		newFrameNum := encodeUtf8(samples + totalSamples)
+
+		// new sample number
+		oldNumSize := getUtf8Size(frame.Num)
+		newSampleNumber := encodeUtf8(samples + totalSamples)
 
 		// copy frame
 		// (header)
 		b := make([]byte, 4)
 		f.Seek(start, os.SEEK_SET)
 		f.Read(b)
-		if b[1]&1 == 1 {
-			return fmt.Errorf("frame hasn't fixed-blocksize")
-		}
-		// from fixed to variable
+		// always variable block-size
 		b[1] |= 1
 		rf.Write(b)
 		totalBytes += 4
@@ -436,14 +437,14 @@ func list(path string) (err error) {
 		}
 
 		// (new frame number)
-		n, _ = rf.Write(newFrameNum)
+		n, _ = rf.Write(newSampleNumber)
 		totalBytes += uint64(n)
-		crcHeader.Write(newFrameNum)
-		crcFrame.Write(newFrameNum)
+		crcHeader.Write(newSampleNumber)
+		crcFrame.Write(newSampleNumber)
 
 		// (additional bytes)
 		if additionalBytes > 0 {
-			f.Seek(start+4+frameNumBytes, os.SEEK_SET)
+			f.Seek(start+4+oldNumSize, os.SEEK_SET)
 			io.CopyN(rf, hr, additionalBytes)
 			totalBytes += uint64(additionalBytes)
 		}
@@ -455,8 +456,8 @@ func list(path string) (err error) {
 		crcFrame.Write([]byte{crc8})
 
 		// (rest of frame)
-		restSize := size - (4 + frameNumBytes + additionalBytes + 1) - 2
-		f.Seek(start+4+frameNumBytes+additionalBytes+1, os.SEEK_SET)
+		restSize := size - (4 + oldNumSize + additionalBytes + 1) - 2
+		f.Seek(start+4+oldNumSize+additionalBytes+1, os.SEEK_SET)
 		io.CopyN(rf, hr, restSize)
 		totalBytes += uint64(restSize)
 
@@ -471,8 +472,8 @@ func list(path string) (err error) {
 			seekTable[i].Offset = offset
 		}
 		// recalculate new frame size
-		if frameNumBytes < int64(len(newFrameNum)) {
-			size += int64(len(newFrameNum)) - frameNumBytes
+		if oldNumSize < int64(len(newSampleNumber)) {
+			size += int64(len(newSampleNumber)) - oldNumSize
 		}
 		// update min and max
 		if uint32(size) < frameSizeMin {

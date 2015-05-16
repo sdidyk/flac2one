@@ -39,7 +39,12 @@ var seekTable []meta.SeekPoint
 var seekMap map[uint64]int
 var picture *meta.Block
 
-var rf, ro *os.File
+var tagAlbum, tagArtist, tagDate string
+var titles []struct {
+	string
+	uint64
+}
+var rf, ro, rcue *os.File
 var md5sum hash.Hash
 
 func main() {
@@ -65,6 +70,14 @@ func main() {
 	md5sum = md5.New()
 	seekTable = make([]meta.SeekPoint, 0, 1024)
 	seekMap = make(map[uint64]int, 1024)
+	titles = make(
+		[]struct {
+			string
+			uint64
+		},
+		0,
+		32,
+	)
 	first = true
 	for _, path := range flag.Args() {
 		fmt.Println(path)
@@ -204,6 +217,25 @@ func main() {
 	// copy frames
 	rf.Seek(0, os.SEEK_SET)
 	io.Copy(ro, rf)
+
+	rcue, err = os.Create("result.cue")
+	if err != nil {
+		log.Fatalln(err)
+		os.Exit(2)
+	}
+	defer rcue.Close()
+
+	if tagDate != "" {
+		rcue.Write([]byte("REM DATE " + tagDate + "\n"))
+	}
+	rcue.Write([]byte("PERFORMER \"" + tagArtist + "\"\n"))
+	rcue.Write([]byte("TITLE \"" + tagAlbum + "\"\n"))
+	rcue.Write([]byte("FILE \"result.flac\" WAVE\n"))
+	for i, v := range titles {
+		rcue.Write([]byte(fmt.Sprintf("  TRACK %02d AUDIO\n", i+1)))
+		rcue.Write([]byte(fmt.Sprintf("    TITLE \"%s\"\n", v.string)))
+		rcue.Write([]byte(fmt.Sprintf("    INDEX 01 %s\n", samplesToTime(v.uint64))))
+	}
 }
 
 func list(path string) (err error) {
@@ -236,15 +268,16 @@ func list(path string) (err error) {
 		if bitsPerSample != stream.Info.BitsPerSample {
 			return fmt.Errorf("bits per sample mismatch; expected %v, got %v", bitsPerSample, stream.Info.BitsPerSample)
 		}
-		if blockSizeMin != stream.Info.BlockSizeMin {
-			return fmt.Errorf("min blocksize mismatch; expected %v, got %v", blockSizeMin, stream.Info.BlockSizeMin)
-		}
-		if blockSizeMax != stream.Info.BlockSizeMax {
-			return fmt.Errorf("max blocksize mismatch; expected %v, got %v", blockSizeMax, stream.Info.BlockSizeMax)
-		}
 	}
 
 	// get meta
+	titles = append(
+		titles,
+		struct {
+			string
+			uint64
+		}{"", totalSamples},
+	)
 	for _, block := range stream.Blocks {
 		switch body := block.Body.(type) {
 		case *meta.SeekTable:
@@ -263,9 +296,24 @@ func list(path string) (err error) {
 			}
 
 		case *meta.VorbisComment:
-			// for tagNum, tag := range body.Tags {
-			// 	fmt.Printf("    comment[%d]: %s=%s\n", tagNum, tag[0], tag[1])
-			// }
+			for _, tag := range body.Tags {
+				switch tag[0] {
+				case "ALBUM", "Album":
+					if first {
+						tagAlbum = tag[1]
+					}
+				case "ARTIST", "Artist":
+					if first {
+						tagArtist = tag[1]
+					}
+				case "DATE", "Date":
+					if first {
+						tagDate = tag[1]
+					}
+				case "TITLE", "Title":
+					titles[len(titles)-1].string = tag[1]
+				}
+			}
 
 		case *meta.Picture:
 			if first && picture == nil && body.Type == 3 {
@@ -289,6 +337,7 @@ func list(path string) (err error) {
 
 	// rewrite frames
 	frames := uint64(0)
+	samples := uint64(0)
 	for {
 		var n int
 		offset := totalBytes
@@ -306,9 +355,6 @@ func list(path string) (err error) {
 			return err
 		}
 		// wait for https://github.com/mewkiz/flac/issues/8
-		if false && frame.HasFixedBlockSize != true {
-			return fmt.Errorf("frame hasn't fixed-blocksize")
-		}
 		frame.Hash(md5sum)
 		next, err := stream.Pos()
 		if err != nil {
@@ -322,9 +368,14 @@ func list(path string) (err error) {
 		// (header)
 		b := make([]byte, 4)
 		f.Seek(start, os.SEEK_SET)
-		hr.Read(b)
+		f.Read(b)
+		if b[1]&1 == 1 {
+			return fmt.Errorf("frame hasn't fixed-blocksize")
+		}
 		rf.Write(b)
 		totalBytes += 4
+		crcHeader.Write(b)
+		crcFrame.Write(b)
 
 		additionalBytes := int64(0)
 		// blocksize bits == 011x
@@ -373,7 +424,7 @@ func list(path string) (err error) {
 		totalBytes += 2
 
 		// recalculate seektable offset
-		sampleNum := frame.Num*uint64(blockSizeMin) + totalSamples
+		sampleNum := samples + totalSamples
 		if i, ok := seekMap[sampleNum]; ok {
 			seekTable[i].Offset = offset
 		}
@@ -388,13 +439,20 @@ func list(path string) (err error) {
 		if uint32(size) > frameSizeMax {
 			frameSizeMax = uint32(size)
 		}
+		if frame.BlockSize < blockSizeMin {
+			blockSizeMin = frame.BlockSize
+		}
+		if frame.BlockSize > blockSizeMax {
+			blockSizeMax = frame.BlockSize
+		}
 		// next iteration
 		start = next
-		frames++
+		frames += 1
+		samples += uint64(frame.BlockSize)
 	}
 
 	// update totals
-	totalSamples += stream.Info.NSamples
+	totalSamples += samples
 	totalFrames += frames
 
 	return nil
@@ -480,4 +538,12 @@ func encUint32(b []byte, n uint32) {
 	b[2] = byte(n >> 8 & 255)
 	b[3] = byte(n & 255)
 	return
+}
+
+func samplesToTime(n uint64) string {
+	t := n * 75 / uint64(sampleRate)
+	m := t / (60 * 75)
+	s := (t - m*60*75) / 75
+	f := t % 75
+	return fmt.Sprintf("%02d:%02d:%02d", m, s, f)
 }

@@ -7,8 +7,9 @@ import (
 	"hash"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
+	"regexp"
+	"strings"
 
 	"github.com/sdidyk/flac2one/flac"
 	"gopkg.in/mewkiz/flac.v1/meta"
@@ -25,6 +26,7 @@ func usage() {
 	fmt.Println()
 	fmt.Println("Options:")
 	flag.PrintDefaults()
+	fmt.Println("\tno options yet")
 	fmt.Println()
 }
 
@@ -39,11 +41,12 @@ var seekTable []meta.SeekPoint
 var seekMap map[uint64]int
 var picture *meta.Block
 
-var tagAlbum, tagArtist, tagDate string
+var tagAlbum, tagArtist, tagDate, tagGenre string
 var titles []struct {
 	string
 	uint64
 }
+var filename string
 var rf, ro, rcue *os.File
 var md5sum hash.Hash
 
@@ -60,7 +63,7 @@ func main() {
 	// create output file
 	rf, err = ioutil.TempFile(os.TempDir(), "flac2one")
 	if err != nil {
-		log.Fatalln(err)
+		fmt.Println(err)
 		os.Exit(2)
 	}
 	defer os.Remove(rf.Name())
@@ -83,15 +86,19 @@ func main() {
 		fmt.Println(path)
 		err := list(path)
 		if err != nil {
-			log.Fatalln(err)
+			fmt.Println(err)
 			os.Exit(3)
 		}
 		first = false
 	}
 
-	ro, err = os.Create("result.flac")
+	// generate file name
+	filename = quoteFilename(fmt.Sprintf("%s - %s", tagArtist, tagAlbum))
+
+	// write result
+	ro, err = os.Create(fmt.Sprintf("%s.flac", filename))
 	if err != nil {
-		log.Fatalln(err)
+		fmt.Println(err)
 		os.Exit(2)
 	}
 	defer ro.Close()
@@ -218,24 +225,29 @@ func main() {
 	rf.Seek(0, os.SEEK_SET)
 	io.Copy(ro, rf)
 
-	rcue, err = os.Create("result.cue")
+	rcue, err = os.Create(fmt.Sprintf("%s.cue", filename))
 	if err != nil {
-		log.Fatalln(err)
+		fmt.Println(err)
 		os.Exit(2)
 	}
 	defer rcue.Close()
 
 	if tagDate != "" {
-		rcue.Write([]byte("REM DATE " + tagDate + "\n"))
+		rcue.Write([]byte(fmt.Sprintf("REM DATE %s\n", tagDate)))
 	}
-	rcue.Write([]byte("PERFORMER \"" + tagArtist + "\"\n"))
-	rcue.Write([]byte("TITLE \"" + tagAlbum + "\"\n"))
-	rcue.Write([]byte("FILE \"result.flac\" WAVE\n"))
+	if tagGenre != "" {
+		rcue.Write([]byte(fmt.Sprintf("REM GENRE %s\n", tagGenre)))
+	}
+	rcue.Write([]byte(fmt.Sprintf("PERFORMER \"%s\"\n", quoteCue(tagArtist))))
+	rcue.Write([]byte(fmt.Sprintf("TITLE \"%s\"\n", quoteCue(tagAlbum))))
+	rcue.Write([]byte(fmt.Sprintf("FILE \"%s.flac\" WAVE\n", filename)))
 	for i, v := range titles {
 		rcue.Write([]byte(fmt.Sprintf("  TRACK %02d AUDIO\n", i+1)))
-		rcue.Write([]byte(fmt.Sprintf("    TITLE \"%s\"\n", v.string)))
+		rcue.Write([]byte(fmt.Sprintf("    TITLE \"%s\"\n", quoteCue(v.string))))
 		rcue.Write([]byte(fmt.Sprintf("    INDEX 01 %s\n", samplesToTime(v.uint64))))
 	}
+
+	os.Exit(0)
 }
 
 func list(path string) (err error) {
@@ -251,13 +263,10 @@ func list(path string) (err error) {
 		sampleRate = stream.Info.SampleRate
 		nChannels = stream.Info.NChannels
 		bitsPerSample = stream.Info.BitsPerSample
-		blockSizeMin = stream.Info.BlockSizeMin
-		blockSizeMax = stream.Info.BlockSizeMax
+		blockSizeMin = 65535
+		blockSizeMax = 0
 		frameSizeMin = 4294967295
 		frameSizeMax = 0
-		if blockSizeMin != blockSizeMax {
-			return fmt.Errorf("not fixed-blocksize; min %v, max %v", stream.Info.BlockSizeMin, stream.Info.BlockSizeMax)
-		}
 	} else {
 		if sampleRate != stream.Info.SampleRate {
 			return fmt.Errorf("sample rate mismatch; expected %v, got %v", sampleRate, stream.Info.SampleRate)
@@ -287,9 +296,9 @@ func list(path string) (err error) {
 					seekTable = append(
 						seekTable,
 						meta.SeekPoint{
-							point.SampleNum + totalSamples,
-							0,
-							point.NSamples,
+							SampleNum: point.SampleNum + totalSamples,
+							Offset:    0,
+							NSamples:  point.NSamples,
 						},
 					)
 				}
@@ -297,25 +306,30 @@ func list(path string) (err error) {
 
 		case *meta.VorbisComment:
 			for _, tag := range body.Tags {
-				switch tag[0] {
-				case "ALBUM", "Album":
+				switch strings.ToUpper(tag[0]) {
+				case "ALBUM":
 					if first {
 						tagAlbum = tag[1]
 					}
-				case "ARTIST", "Artist":
+				case "ARTIST":
 					if first {
 						tagArtist = tag[1]
 					}
-				case "DATE", "Date":
+				case "DATE":
 					if first {
 						tagDate = tag[1]
 					}
-				case "TITLE", "Title":
+				case "GENRE":
+					if first {
+						tagGenre = tag[1]
+					}
+				case "TITLE":
 					titles[len(titles)-1].string = tag[1]
 				}
 			}
 
 		case *meta.Picture:
+			// save only Cover (front)
 			if first && picture == nil && body.Type == 3 {
 				picture = block
 			}
@@ -362,7 +376,7 @@ func list(path string) (err error) {
 		}
 		size := next - start
 		frameNumBytes := getUtf8Size(frame.Num)
-		newFrameNum := encodeUtf8(frame.Num + totalFrames)
+		newFrameNum := encodeUtf8(samples + totalSamples)
 
 		// copy frame
 		// (header)
@@ -372,6 +386,8 @@ func list(path string) (err error) {
 		if b[1]&1 == 1 {
 			return fmt.Errorf("frame hasn't fixed-blocksize")
 		}
+		// from fixed to variable
+		b[1] |= 1
 		rf.Write(b)
 		totalBytes += 4
 		crcHeader.Write(b)
@@ -380,16 +396,16 @@ func list(path string) (err error) {
 		additionalBytes := int64(0)
 		// blocksize bits == 011x
 		if b[2]&0xE0 == 0x60 {
-			additionalBytes += 1
+			additionalBytes++
 			if b[2]&0x10>>4 != 0 {
-				additionalBytes += 1
+				additionalBytes++
 			}
 		}
 		// sample rate bits == 11xx
 		if b[2]&0x0C == 0x0C {
-			additionalBytes += 1
+			additionalBytes++
 			if b[2]&0x03 != 0 {
-				additionalBytes += 1
+				additionalBytes++
 			}
 		}
 
@@ -409,7 +425,7 @@ func list(path string) (err error) {
 		// (new crc8)
 		crc8 := crcHeader.Sum8()
 		n, _ = rf.Write([]byte{crc8})
-		totalBytes += 1
+		totalBytes++
 		crcFrame.Write([]byte{crc8})
 
 		// (rest of frame)
@@ -447,7 +463,7 @@ func list(path string) (err error) {
 		}
 		// next iteration
 		start = next
-		frames += 1
+		frames++
 		samples += uint64(frame.BlockSize)
 	}
 
@@ -546,4 +562,16 @@ func samplesToTime(n uint64) string {
 	s := (t - m*60*75) / 75
 	f := t % 75
 	return fmt.Sprintf("%02d:%02d:%02d", m, s, f)
+}
+
+func quoteCue(s string) string {
+	return strings.Replace(s, "\"", "'", -1)
+}
+
+func quoteFilename(s string) string {
+	reg, err := regexp.Compile("[^ \\-\\w',.\\[\\]\\(\\)]+")
+	if err != nil {
+		panic(err)
+	}
+	return reg.ReplaceAllString(quoteCue(s), "")
 }

@@ -17,16 +17,24 @@ import (
 	"gopkg.in/mewpkg/hashutil.v1/crc8"
 )
 
+var flagSilent = flag.Bool("silent", false, "")
+var flagDelete = flag.Bool("delete", false, "")
+var flagOutputDir = flag.String("output", ".", "")
+
 func init() {
+	flag.BoolVar(flagSilent, "s", false, "")
+	flag.BoolVar(flagDelete, "d", false, "")
+	flag.StringVar(flagOutputDir, "o", ".", "")
 	flag.Usage = usage
 }
 
 func usage() {
-	fmt.Println("Usage: flac2one [options] <flac files>")
+	fmt.Println("Usage: flac2one [options] <files>")
 	fmt.Println()
-	fmt.Println("Options:")
-	flag.PrintDefaults()
-	fmt.Println("\tno options yet")
+	fmt.Println(`Options:
+    -s, --silent        Silent mode
+    -d, --delete        Delete input files after processing
+    -o, --output=DIR    Output directory (defaults to current dir)`)
 	fmt.Println()
 }
 
@@ -83,7 +91,9 @@ func main() {
 	)
 	first = true
 	for _, path := range flag.Args() {
-		fmt.Println(path)
+		if !*flagSilent {
+			fmt.Printf("Processing: %s\n", path)
+		}
 		err := list(path)
 		if err != nil {
 			fmt.Println(err)
@@ -93,9 +103,13 @@ func main() {
 	}
 
 	// generate file name
-	filename = quoteFilename(fmt.Sprintf("%s - %s", tagArtist, tagAlbum))
+	filename = fmt.Sprintf("%s/%s - %s", *flagOutputDir, quoteFilename(tagArtist), quoteFilename(tagAlbum))
 
-	// write result
+	if !*flagSilent {
+		fmt.Printf("Writing to \"%s.[flac|cue]\"\n", filename)
+	}
+
+	// write flac-file
 	ro, err = os.Create(fmt.Sprintf("%s.flac", filename))
 	if err != nil {
 		fmt.Println(err)
@@ -225,6 +239,7 @@ func main() {
 	rf.Seek(0, os.SEEK_SET)
 	io.Copy(ro, rf)
 
+	// write cue-file
 	rcue, err = os.Create(fmt.Sprintf("%s.cue", filename))
 	if err != nil {
 		fmt.Println(err)
@@ -245,6 +260,17 @@ func main() {
 		rcue.Write([]byte(fmt.Sprintf("  TRACK %02d AUDIO\n", i+1)))
 		rcue.Write([]byte(fmt.Sprintf("    TITLE \"%s\"\n", quoteCue(v.string))))
 		rcue.Write([]byte(fmt.Sprintf("    INDEX 01 %s\n", samplesToTime(v.uint64))))
+	}
+
+	// delete files
+	if *flagDelete {
+		for _, path := range flag.Args() {
+			err := os.Remove(path)
+			if err != nil {
+				fmt.Println(err)
+				os.Exit(3)
+			}
+		}
 	}
 
 	os.Exit(0)

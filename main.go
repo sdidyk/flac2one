@@ -46,7 +46,6 @@ var nChannels, bitsPerSample uint8
 var totalBytes, totalSamples, totalFrames uint64
 
 var seekTable []meta.SeekPoint
-var seekMap map[uint64]int
 var picture *meta.Block
 
 var tagAlbum, tagArtist, tagDate, tagGenre string
@@ -80,7 +79,6 @@ func main() {
 	// read files
 	md5sum = md5.New()
 	seekTable = make([]meta.SeekPoint, 0, 1024)
-	seekMap = make(map[uint64]int, 1024)
 	titles = make(
 		[]struct {
 			string
@@ -315,21 +313,7 @@ func list(path string) (err error) {
 	)
 	for _, block := range stream.Blocks {
 		switch body := block.Body.(type) {
-		case *meta.SeekTable:
-			for _, point := range body.Points {
-				if point.SampleNum != meta.PlaceholderPoint {
-					seekMap[point.SampleNum+totalSamples] = len(seekTable)
-					seekTable = append(
-						seekTable,
-						meta.SeekPoint{
-							SampleNum: point.SampleNum + totalSamples,
-							Offset:    0,
-							NSamples:  point.NSamples,
-						},
-					)
-				}
-			}
-
+		// tags: parse
 		case *meta.VorbisComment:
 			for _, tag := range body.Tags {
 				switch strings.ToUpper(tag[0]) {
@@ -355,7 +339,7 @@ func list(path string) (err error) {
 			}
 
 		case *meta.Picture:
-			// save only Cover (front)
+			// picture: save only Cover (front)
 			if first && picture == nil && body.Type == 3 {
 				picture = block
 			}
@@ -378,6 +362,7 @@ func list(path string) (err error) {
 	// rewrite frames
 	frames := uint64(0)
 	samples := uint64(0)
+	lastSecIndex := uint64(0)
 	for {
 		var n int
 		offset := totalBytes
@@ -466,11 +451,25 @@ func list(path string) (err error) {
 		rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
 		totalBytes += 2
 
-		// recalculate seektable offset
+		// add seektable offset
+		// approx every 10 seconds of each track
 		sampleNum := samples + totalSamples
-		if i, ok := seekMap[sampleNum]; ok {
-			seekTable[i].Offset = offset
+		secIndex := samples / uint64(sampleRate) / 10
+		if samples == 0 || secIndex > lastSecIndex {
+			// do not repeat twice
+			if !(len(seekTable) > 0 && seekTable[len(seekTable)-1].SampleNum == sampleNum) {
+				seekTable = append(
+					seekTable,
+					meta.SeekPoint{
+						SampleNum: sampleNum,
+						Offset:    offset,
+						NSamples:  frame.BlockSize,
+					},
+				)
+				lastSecIndex = secIndex
+			}
 		}
+
 		// recalculate new frame size
 		if oldNumSize < int64(len(newSampleNumber)) {
 			size += int64(len(newSampleNumber)) - oldNumSize

@@ -36,7 +36,7 @@ Writing to "./Nine Inch Nails - Pretty hate machine [2010, UMe, B0015099-02].[fl
 * Tool takes tags ARTIST, DATE and GENRE only from first file and saves it to CUE-file
 * Title for each track is generated from tag TITLE
 * Picture is taken only from first file and only if its type is "Cover (front)"
-* Recalculated seek table is based on the data in input files
+* Seektable is recalculated, points are set every 10 seconds
 * Result flac file is always variable block-size type
 
 ## Requirements

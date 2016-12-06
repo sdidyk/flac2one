@@ -11,10 +11,10 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/mewkiz/flac/meta"
 	"github.com/sdidyk/flac2one/flac"
-	"gopkg.in/mewkiz/flac.v1/meta"
-	"gopkg.in/mewpkg/hashutil.v1/crc16"
-	"gopkg.in/mewpkg/hashutil.v1/crc8"
+	"github.com/sdidyk/flac2one/hashutil/crc16"
+	"github.com/sdidyk/flac2one/hashutil/crc8"
 )
 
 var flagSilent = flag.Bool("silent", false, "")
@@ -435,10 +435,10 @@ func list(path string) (err error) {
 		}
 
 		// (new crc8)
-		crc8 := crcHeader.Sum8()
-		n, _ = rf.Write([]byte{crc8})
+		crc8s := crcHeader.Sum8()
+		n, _ = rf.Write([]byte{crc8s})
 		totalBytes++
-		crcFrame.Write([]byte{crc8})
+		crcFrame.Write([]byte{crc8s})
 
 		// (rest of frame)
 		restSize := size - (4 + oldNumSize + additionalBytes + 1) - 2
@@ -447,8 +447,8 @@ func list(path string) (err error) {
 		totalBytes += uint64(restSize)
 
 		// (new crc16)
-		crc16 := crcFrame.Sum16()
-		rf.Write([]byte{byte(crc16 >> 8), byte(crc16 & 0xff)})
+		crc16s := crcFrame.Sum16()
+		rf.Write([]byte{byte(crc16s >> 8), byte(crc16s & 0xff)})
 		totalBytes += 2
 
 		// add seektable offset
@@ -595,7 +595,7 @@ func quoteCue(s string) string {
 }
 
 func quoteFilename(s string) string {
-	reg, err := regexp.Compile("[^ \\-\\w',.\\[\\]\\(\\)]+")
+	reg, err := regexp.Compile("[^ \\-\\w',.\\[\\]()]+")
 	if err != nil {
 		panic(err)
 	}

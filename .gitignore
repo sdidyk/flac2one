@@ -1,3 +1,5 @@
 *.flac
 *.cue
 *.pprof
+.idea
+*.iml
